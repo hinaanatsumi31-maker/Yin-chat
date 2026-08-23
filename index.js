@@ -148,6 +148,156 @@ app.get("/api/profile/:playerId", (req, res) => {
     res.json({ success: true, profile });
 });
 
+// ─── VISUAL SYNC STORAGE ─────────────────────────────────────────────────────
+// Solo se comparten metadatos pequeños; nunca modelos, código ni URLs ejecutables.
+const VISUAL_TTL = 30;                 // seconds without refresh before expiration
+const MAX_VISUAL_STATES = 200;         // global in-memory safety cap
+const VISUAL_RATE_WINDOW = 10;         // seconds
+const VISUAL_RATE_LIMIT = 30;          // requests per IP and window
+let visualStates = Object.create(null); // sessionKey:playerId:type -> state
+let visualRate = Object.create(null);   // ip -> { startedAt, count }
+
+function visualString(value, maxLength) {
+    if (value === undefined || value === null) return "";
+    return String(value).trim().slice(0, maxLength);
+}
+
+function visualSessionKey(placeId, jobId) {
+    return visualString(placeId, 40) + ":" + visualString(jobId, 80);
+}
+
+function cleanVisualStates() {
+    const now = Math.floor(Date.now() / 1000);
+    for (const key in visualStates) {
+        if (!visualStates[key] || visualStates[key].expiresAt <= now) {
+            delete visualStates[key];
+        }
+    }
+}
+
+function allowVisualRequest(req) {
+    const ip = visualString(req.ip || "unknown", 80);
+    const now = Math.floor(Date.now() / 1000);
+    const entry = visualRate[ip];
+    if (!entry || now - entry.startedAt >= VISUAL_RATE_WINDOW) {
+        visualRate[ip] = { startedAt: now, count: 1 };
+        return true;
+    }
+    entry.count += 1;
+    return entry.count <= VISUAL_RATE_LIMIT;
+}
+
+function readVisualIdentity(body) {
+    const data = body || {};
+    const playerId = visualString(data.playerId, 40);
+    const playerName = visualString(data.playerName, 32);
+    const placeId = visualString(data.placeId, 40);
+    const jobId = visualString(data.jobId, 80);
+    if (!playerId || !placeId || !jobId) {
+        return { error: "missing playerId, placeId or jobId" };
+    }
+    return { playerId, playerName, placeId, jobId };
+}
+
+function readVisualType(value) {
+    const visualType = visualString(value, 16).toLowerCase();
+    if (visualType !== "emote" && visualType !== "cosmetic") return "";
+    return visualType;
+}
+
+// ─── POST /api/visual/publish ─────────────────────────────────────────────────
+// Publica o refresca un estado visual para usuarios de Yin Yang en el mismo JobId.
+app.post("/api/visual/publish", (req, res) => {
+    if (!allowVisualRequest(req)) {
+        return res.json({ success: false, error: "visual sync rate limit" });
+    }
+
+    const identity = readVisualIdentity(req.body);
+    if (identity.error) return res.json({ success: false, error: identity.error });
+
+    const visualType = readVisualType(req.body && req.body.visualType);
+    const action = visualString(req.body && req.body.action, 16).toLowerCase();
+    const visualName = visualString(req.body && req.body.visualName, 96);
+    const variant = visualString(req.body && req.body.variant, 32);
+
+    if (!visualType) return res.json({ success: false, error: "visualType must be emote or cosmetic" });
+    if (action !== "activate" && action !== "update") {
+        return res.json({ success: false, error: "action must be activate or update" });
+    }
+    if (!visualName) return res.json({ success: false, error: "missing visualName" });
+
+    cleanVisualStates();
+    const sessionKey = visualSessionKey(identity.placeId, identity.jobId);
+    const stateKey = sessionKey + ":" + identity.playerId + ":" + visualType;
+    if (!visualStates[stateKey] && Object.keys(visualStates).length >= MAX_VISUAL_STATES) {
+        return res.json({ success: false, error: "visual sync capacity reached" });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const state = {
+        playerId: identity.playerId,
+        playerName: identity.playerName,
+        placeId: identity.placeId,
+        jobId: identity.jobId,
+        visualType,
+        visualName,
+        variant,
+        action,
+        updatedAt: now,
+        expiresAt: now + VISUAL_TTL,
+    };
+    visualStates[stateKey] = state;
+    res.json({ success: true, state });
+});
+
+// ─── GET /api/visual/snapshot ─────────────────────────────────────────────────
+// Devuelve únicamente estados activos del mismo PlaceId + JobId.
+app.get("/api/visual/snapshot", (req, res) => {
+    if (!allowVisualRequest(req)) {
+        return res.json({ success: false, error: "visual sync rate limit" });
+    }
+
+    const placeId = visualString(req.query.placeId, 40);
+    const jobId = visualString(req.query.jobId, 80);
+    if (!placeId || !jobId) {
+        return res.json({ success: false, error: "missing placeId or jobId" });
+    }
+
+    cleanVisualStates();
+    const sessionKey = visualSessionKey(placeId, jobId);
+    const states = [];
+    for (const key in visualStates) {
+        const state = visualStates[key];
+        if (state && key.indexOf(sessionKey + ":") === 0) states.push(state);
+    }
+    res.json({
+        success: true,
+        states,
+        ttl: VISUAL_TTL,
+        serverTime: Math.floor(Date.now() / 1000),
+    });
+});
+
+// ─── POST /api/visual/remove ──────────────────────────────────────────────────
+// Retira un emote o cosmético del jugador sin tocar la otra categoría.
+app.post("/api/visual/remove", (req, res) => {
+    if (!allowVisualRequest(req)) {
+        return res.json({ success: false, error: "visual sync rate limit" });
+    }
+
+    const identity = readVisualIdentity(req.body);
+    if (identity.error) return res.json({ success: false, error: identity.error });
+    const visualType = readVisualType(req.body && req.body.visualType);
+    if (!visualType) return res.json({ success: false, error: "visualType must be emote or cosmetic" });
+
+    cleanVisualStates();
+    const sessionKey = visualSessionKey(identity.placeId, identity.jobId);
+    const stateKey = sessionKey + ":" + identity.playerId + ":" + visualType;
+    const existed = Boolean(visualStates[stateKey]);
+    delete visualStates[stateKey];
+    res.json({ success: true, removed: existed });
+});
+
 // ─── BUILDER STORAGE ────────────────────────────────────────────────────────
 const MAX_PARTS  = 500;
 let builderParts = [];   // { id, shape, x, y, z, sx, sy, sz, rx, ry, rz, r, g, b, material, placedBy }
